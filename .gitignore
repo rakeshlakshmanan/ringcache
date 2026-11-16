@@ -1,0 +1,12 @@
+# Build output
+bin/
+
+# Benchmark scratch runs (committed runs live in docs/results/<date>-<scenario>/)
+docs/results/tmp/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
