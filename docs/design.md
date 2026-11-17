@@ -51,3 +51,36 @@ owners first and switches the ring when every copy is done.
   removed; it would have broken `go build ./...`.
 - Packages are created in the phase that first needs them; phase 0 adds
   only `internal/clock` and `internal/config`.
+
+### Phase 1
+
+- Dependency added: `github.com/cespare/xxhash/v2` v2.3.0, named by the
+  plan. `keyhash.Sum` is the only hash function; the ring, the store and
+  the migration range filter all go through it.
+- `Clock.NowAfter` takes the mutex once and runs the update and the
+  issue under it, rather than calling the exported `Update` then `Now`
+  as the plan words it. The result is the same, but holding the lock
+  across both steps stops a concurrent caller slipping a version in
+  between and leaving the result at or below the argument. The store's
+  `SetLocal` relies on that, so the guarantee has to be atomic.
+- The plan's `TestHLC_UpdateRemoteBehind` is described as "a remote
+  version behind physical time doesn't change what `Now` returns next".
+  Taken literally that can't hold: the plan's own `Update` rules say the
+  counter is raised in every case, so `Update` always advances the
+  clock. The test instead asserts the property that matters and is
+  provable: a behind remote makes `Update` degenerate into an ordinary
+  local tick, contributing neither its counter nor its wall value. The
+  assertion compares against a control clock that only ticks locally. A
+  mutation check confirmed it has teeth: making the behind-remote branch
+  adopt `max(last, remote)` counters fails the test.
+- The counter-overflow carry is unreachable through local calls (no node
+  issues 2^32 versions in one millisecond), so
+  `TestHLC_CounterOverflowCarries` drives it through a peer version at
+  the top of the counter range. Added beyond the plan's test table,
+  along with golden-value tests for `keyhash`, which pin the hash
+  function: changing it is a wire-visible change, since nodes and
+  clients must compute identical rings.
+- The clock-skew warning uses `slog.Default()` with `node_id` as an
+  attribute, because the plan fixes `New(nodeID string, c clock.Clock)`
+  and takes no logger. Its once-a-minute rate limit reads the injected
+  `clock.Clock`, so a fake clock makes the suppression deterministic.
