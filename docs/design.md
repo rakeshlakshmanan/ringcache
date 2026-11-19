@@ -194,3 +194,100 @@ genuine races where a higher sequence reached the same key first.
   regenerating: the diff reported both the proto and the stale
   `types.pb.go`, so drift fails the build rather than passing quietly.
   Regeneration is byte-identical, which that check depends on.
+
+### Phase 4
+
+- Dependencies added, both named by the plan:
+  `github.com/prometheus/client_golang` v1.25.0 and
+  `golang.org/x/sync` (errgroup).
+- `Config` holds only what varies between nodes. The tuning constants in
+  `defaults.go` stay compile-time, so every node in a cluster agrees on
+  them without having to exchange them.
+- `--advertise` defaults to `<node-id>:<port from --listen>` rather than
+  to `--listen` itself, because the default listen address is a wildcard
+  that no peer can dial. Under docker-compose the node ID is the
+  container name, which resolves, so the default works unchanged there.
+- `--listen` rejects port 0. An ephemeral port cannot be advertised: a
+  node has to publish its address before its listener exists. Tests that
+  want an arbitrary port pass a listener through `node.Options` instead,
+  which is the same door the phase 6 test cluster uses for bufconn.
+- The plan's `TestConfig_Invalid` asks for "bad durations and unknown
+  flags". This phase defines no duration flag — timing lives in
+  `defaults.go` — so the test covers the invalid values that do exist:
+  an unknown flag, a stray argument, a bad log level, an empty or
+  slash-bearing node ID, and each address flag without a port.
+- Metrics are `ringcache_requests_total{method,code}`,
+  `ringcache_request_duration_seconds{method}`,
+  `ringcache_handler_panics_total` and the `ringcache_store_keys` and
+  `ringcache_store_bytes` gauges. Every one carries a `node` label, and
+  they live in a per-node registry, so several nodes in one process
+  report separate numbers. The method label is shortened to
+  `Cache/Set`, keeping the service name without the proto package.
+- The store gauges are `GaugeFunc`s reading `Store.Len` and
+  `Store.Bytes` at scrape time, so the store holds no reference to the
+  metrics and the numbers cannot go stale.
+- The latency histogram uses `ExponentialBucketsRange(50e-6, 1, 18)`:
+  the plan's 50 µs to 1 s, at about four buckets per decade.
+- `versionToProto` lives in `internal/server` as an unexported helper
+  rather than in a conversion package of its own. Phase 8 is the first
+  phase that needs the reverse direction, so the pair moves somewhere
+  shared then rather than being invented ahead of a second caller.
+- `Ownership` errors are plain Go errors — `WrongOwnerError`,
+  `ErrNoRing`, `ErrFenced` — mapped to statuses in one place,
+  `toStatus`. An implementation never builds a gRPC status itself, so
+  phase 6 can replace `allOwner` without touching the error contract.
+- `AllOwner` reports epoch 0, which means "no ring published". A client
+  treats any epoch it sees as at least as new as its own, so a lone node
+  answering at epoch 0 never pushes a client into a refresh loop.
+- The `Gate` hook is wired now and left nil. It rejects a request before
+  the handler runs, whatever key the request names, which is what phase
+  10 needs for fencing; `TestCache_Gate` exercises it with a stub.
+- `Node.Start` runs the sweeper and both servers under an errgroup, with
+  a fourth goroutine that waits on the group context and shuts the
+  servers down. Shutdown has to be a goroutine rather than a deferred
+  call: a deferred one would not run until `Wait` returned, and `Wait`
+  cannot return while the servers are still serving.
+- `GracefulStop` has no timeout of its own, so a wedged handler would
+  hang the process. It runs in a goroutine with `Stop` as the 5 s
+  fallback the plan asks for.
+- Listeners are opened in `New`, not `Start`, so a port already in use
+  fails before the process claims to be running and the binary exits
+  non-zero. `TestNode_ListenConflict` covers it.
+- `/healthz` is gated on an `atomic.Bool` that `Start` sets and
+  `shutdown` clears. Phase 10 clears it while fenced, so an operator and
+  a load balancer see the same state the gate enforces.
+- `--healthcheck` is handled before flag parsing, by scanning argv, so
+  the probe can take the same flags as the node it probes and read the
+  right metrics port. The final image has no shell, so running the
+  binary again is the only way to probe it. A wildcard metrics address
+  is probed over the loopback.
+- The Dockerfile stamps `main.version` with the commit through a
+  `COMMIT` build argument and builds every binary under `cmd/` in one
+  step, so later phases' binaries need no change to it. The final image
+  is `distroless/static-debian12:nonroot`, 25.3 MB.
+- A mutation check confirmed the size-limit test has teeth: changing the
+  key check from `>` to `>=` made `TestCache_SizeLimits` fail on the
+  1 KiB key it is supposed to accept.
+- Tests beyond the plan's table: `TestCache_WrongOwner` (the epoch is
+  readable from the status detail, which is how a client learns its ring
+  is stale), `TestCache_NoRing`, `TestCache_Gate`,
+  `TestCache_PanicRecovered`, `TestCache_TTLOutOfRange`,
+  `TestCache_GetRing`, and the `internal/node` tests for `/healthz`,
+  `/metrics`, shutdown on cancellation, two nodes in one process and the
+  listen conflict.
+- On macOS the default `--listen :7000` collides with the AirPlay
+  Receiver, which also listens there. The default is left as the plan
+  fixes it, since the clusters run in containers; a local run needs an
+  explicit `--listen`.
+
+#### Phase 4 manual verification
+
+A node was run and driven with grpcurl: reflection listed
+`ringcache.v1.Cache`, Set returned a version, Get read it back, TTL
+reported 4,988 ms left on a 5 s key, Delete made the following Get a
+miss, an empty key gave INVALID_ARGUMENT, and `/metrics` carried the
+`ringcache_` series. SIGTERM shut the node down cleanly with exit 0.
+
+The image was built and run: the container reached `healthy` through the
+`--healthcheck` probe, served RPCs on its published ports, ran as
+`nonroot`, and exited 0 on `docker stop`.
