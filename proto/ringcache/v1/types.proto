@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package ringcache.v1;
+
+option go_package = "github.com/rakeshlakshmanan/ringcache/gen/ringcachev1;ringcachev1";
+
+// Version is a hybrid logical clock stamp. It orders by wall time, then
+// by the logical counter, then by node ID. Every path that stores an
+// entry keeps the newest version, so duplicate and reordered writes do
+// no harm.
+message Version {
+  // Physical part, in Unix milliseconds.
+  int64 wall_ms = 1;
+  // Counter for events inside one millisecond. It keeps versions
+  // increasing when the wall clock stands still or jumps back.
+  uint32 logical = 2;
+  // Tie-break between nodes, only consulted when wall_ms and logical
+  // are equal. Protobuf has no 16-bit type; the node ID is a uint16.
+  uint32 node_id = 3;
+}
+
+// Entry is one stored value, or a tombstone standing in for a delete.
+message Entry {
+  bytes value = 1;
+  // Absolute expiry in Unix milliseconds, 0 for no expiry. The primary
+  // stamps it when it accepts the write and every copy keeps that same
+  // value, so all copies of a key expire together however they were
+  // made.
+  int64 expires_at_ms = 2;
+  Version version = 3;
+  // A delete. The tombstone is kept so a late replication message or
+  // migration copy cannot resurrect the key.
+  bool tombstone = 4;
+}
+
+// KeyedEntry pairs a key with its entry, as migration batches carry it.
+message KeyedEntry {
+  bytes key = 1;
+  Entry entry = 2;
+}
+
+// Member is one node in a published ring.
+message Member {
+  string id = 1;
+  // The gRPC address other nodes and clients dial.
+  string addr = 2;
+}
+
+// RingView is everything needed to rebuild the ring: nodes and clients
+// compute identical rings from the same member list, so only the list
+// and its epoch travel over the network.
+message RingView {
+  // Epoch of this ring. It only increases.
+  uint64 epoch = 1;
+  repeated Member members = 2;
+  // Tokens each member places on the ring.
+  uint32 vnodes = 3;
+  // Copies of each key: the replication factor.
+  uint32 rf = 4;
+}
+
+// Range is a half-open interval of the hash ring: the keys with hash h
+// where start < h <= end. When start >= end the range wraps past the top
+// of the ring, and the test becomes h > start || h <= end.
+message Range {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// WrongOwner is attached as a status detail to the FAILED_PRECONDITION
+// a node returns when it is not the owner of a key. The epoch tells the
+// client whether its ring is behind.
+message WrongOwner {
+  uint64 node_epoch = 1;
+}

@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package ringcache.v1;
+
+import "ringcache/v1/types.proto";
+
+option go_package = "github.com/rakeshlakshmanan/ringcache/gen/ringcachev1;ringcachev1";
+
+// Peer is the API nodes use between themselves. It is never exposed to
+// clients.
+service Peer {
+  // Replicate carries writes from a key's primary to its replica, and
+  // forwarded writes from a migration source to the destination that is
+  // taking the arc over. One stream per destination keeps messages in
+  // order; acks are matched to messages by seq.
+  rpc Replicate(stream ReplicateRequest) returns (stream ReplicateAck);
+
+  // StreamRange copies a set of hash ranges from the source holding
+  // them to the destination taking them on, for both MOVE and REPAIR
+  // tasks. The destination applies entries newest-wins, so a stream can
+  // restart from the beginning at any time.
+  rpc StreamRange(RangeRequest) returns (stream EntryBatch);
+
+  // ReadLocal reads this node's store with no ownership check. Tests,
+  // ringctl and quorum-mode reads use it.
+  rpc ReadLocal(ReadLocalRequest) returns (ReadLocalResponse);
+}
+
+// AckStatus says what the receiver did with a replicated write. The
+// sender treats APPLIED and IGNORED_OLDER as success: both mean the
+// receiver holds a version at least as new as the one sent. Every
+// REJECTED status puts the key in the sender's retry set.
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_STATUS_APPLIED = 1;
+  // The receiver already held a version at least as new.
+  ACK_STATUS_IGNORED_OLDER = 2;
+  // The sender's epoch is behind the receiver's, so the sender's view
+  // of who owns this key is out of date.
+  ACK_STATUS_REJECTED_STALE_EPOCH = 3;
+  // The receiver is not on this key's preference list, and the message
+  // is not a forwarded write naming it as a task destination.
+  ACK_STATUS_REJECTED_NOT_OWNER = 4;
+  // The receiver could not renew its etcd lease and has stopped
+  // serving.
+  ACK_STATUS_REJECTED_FENCED = 5;
+}
+
+message ReplicateRequest {
+  // Per-stream sequence number, used to match acks to messages.
+  uint64 seq = 1;
+  string sender_id = 2;
+  uint64 sender_epoch = 3;
+  bytes key = 4;
+  Entry entry = 5;
+  // True when this is a write forwarded to a node that is taking the
+  // key's arc over but does not own it yet.
+  bool forwarded = 6;
+  // The task the forwarded write belongs to, empty otherwise.
+  string task_id = 7;
+}
+
+message ReplicateAck {
+  uint64 seq = 1;
+  AckStatus status = 2;
+  uint64 receiver_epoch = 3;
+}
+
+message RangeRequest {
+  string task_id = 1;
+  // The epoch the task's ring switch will publish. The source drops its
+  // forwarding entry once it has seen a ring at this epoch or later.
+  uint64 task_epoch = 2;
+  string dest_id = 3;
+  repeated Range ranges = 4;
+  // True for a MOVE: the source also forwards writes it accepts in
+  // these ranges while the snapshot streams, so nothing can fall
+  // between the snapshot and the ring switch. REPAIR needs no
+  // forwarding, since the destination is already the key's replica and
+  // receives new writes through normal replication.
+  bool forward_writes = 5;
+}
+
+message EntryBatch {
+  repeated KeyedEntry entries = 1;
+  // Set on the final batch, which may be empty.
+  bool last = 2;
+}
+
+message ReadLocalRequest {
+  bytes key = 1;
+}
+
+message ReadLocalResponse {
+  bool found = 1;
+  // The raw stored entry, tombstone flag and expiry included.
+  Entry entry = 2;
+}

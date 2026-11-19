@@ -18,5 +18,9 @@ jobs:
       - name: make check
         run: make check
 
-      # From phase 3 on this job also runs `make proto` and fails if
-      # `git diff --exit-code` shows changes in gen/.
+      # The generated code is committed, so a .proto change that was not
+      # regenerated has to fail the build rather than drift silently.
+      - name: generated code is up to date
+        run: |
+          make proto
+          git diff --exit-code

@@ -1,0 +1,16 @@
+version: v2
+plugins:
+  # Both plugins are pinned as Go tool dependencies in go.mod and run
+  # through `go tool`, so no separate install step is needed.
+  #
+  # module= strips that prefix from each file's go_package, so the
+  # protos under proto/ringcache/v1/ generate into gen/ringcachev1/
+  # rather than a directory tree mirroring the full import path.
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: gen
+    opt:
+      - module=github.com/rakeshlakshmanan/ringcache/gen
+  - local: ["go", "tool", "protoc-gen-go-grpc"]
+    out: gen
+    opt:
+      - module=github.com/rakeshlakshmanan/ringcache/gen

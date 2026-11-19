@@ -1,0 +1,23 @@
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+  # The project specification fixes these names, and later phases refer
+  # to them, so the wire contract wins over buf's naming conventions.
+  # Everything else in STANDARD applies, including the enum prefix and
+  # zero-value rules that AckStatus follows.
+  except:
+    # The spec declares "service Cache" and "service Peer", not
+    # CacheService and PeerService.
+    - SERVICE_SUFFIX
+    # GetRing returns RingView, which is a shared type rather than a
+    # response wrapper; Replicate returns ReplicateAck and StreamRange
+    # returns EntryBatch, both named for what they carry.
+    - RPC_RESPONSE_STANDARD_NAME
+    # StreamRange takes RangeRequest, named for the ranges it asks for.
+    - RPC_REQUEST_STANDARD_NAME
+breaking:
+  use:
+    - FILE
