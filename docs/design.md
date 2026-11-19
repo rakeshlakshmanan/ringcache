@@ -488,3 +488,94 @@ All three were caught.
    `TestClient_WriteDoesNotRetryElsewhere`.
 3. Dropping the refresh-and-retry on a wrong-owner error failed
    `TestClient_StaleRingRefresh`.
+
+### Phase 7
+
+- Dependencies added, both named by the plan:
+  `github.com/HdrHistogram/hdrhistogram-go` v1.4.0 and
+  `golang.org/x/time` (rate).
+- A value's padding comes from a PRNG seeded with the key index and the
+  sequence, so the whole value is a pure function of its header rather
+  than only the first 16 bytes. `VerifyPadding` then catches a value
+  that was truncated or partly overwritten, which neither the header
+  nor a length check would see.
+- The key index travels inside the value. Without it, a bug that filed
+  a value under the wrong key would read back as an ordinary stale
+  read; with it, that is corruption and fails the run.
+- `Preload` does not stop at the first failed write. A preload write
+  that fails is a write in doubt like any other and the checker already
+  treats it as one; aborting would also make the result depend on which
+  goroutine happened to hit the failure. It returns the count, and the
+  error is reserved for the caller cancelling.
+- One mutex guards all of `Stats`. At the plan's 20,000 requests per
+  second that is 20,000 lock acquisitions around a histogram record of
+  some tens of nanoseconds — far below the cost of the RPC being
+  measured — so sharding it would buy nothing and make merging the
+  per-second buckets harder.
+- A latency above the histogram's 10 s ceiling is clamped rather than
+  dropped. Losing the slowest requests would flatter exactly the tail
+  the failure phases are about.
+- The rate limiter has a burst of one. A larger burst would hand out a
+  second's worth of tokens at once after a pause, which the CSV would
+  show as a spike the cluster never actually saw.
+- `Report.FailureCodes` was added beyond the plan: a run that reports
+  failures is not diagnosable without them, since a timeout, an
+  unavailable node and a rejected argument mean different things. It is
+  what identified the driver bug below.
+
+#### Phase 7: a bug the checker found in the driver
+
+The first `-race` run of `TestDriver_StaticCluster` reported exactly
+one failed request, and did so on every run. The failure was
+`DeadlineExceeded`, but the slowest request in the whole run was 2.9 ms
+against a 50 ms attempt deadline, so nothing had actually timed out.
+
+The cause was in `Driver.Run`: each request was given the context
+carrying the run's *duration*. When the duration expired, whichever
+request was in flight was cancelled and counted as a failure of the
+cluster. At 5,000 requests per second with roughly 200 µs requests,
+about one request is in flight at any instant, which is why it was
+exactly one, every time.
+
+The duration now bounds when workers stop *issuing* requests, not the
+requests themselves; requests take the caller's context and remain
+bounded by the client's own per-attempt timeout. Three `-race` runs
+after the fix were clean.
+
+This mattered more than one spurious failure suggests: every later
+phase asserts that a run is clean, so the bug would have made each of
+those assertions fail for a reason that had nothing to do with the
+failure being tested.
+
+#### Phase 7 measurements
+
+Three static nodes on one machine, 100,000 keys preloaded, 30 s at
+5,000 ops/s, 80% reads, 150,000 requests:
+
+| Operation | Count | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| get | 119,869 | 44 µs | 74 µs | 239 µs | 560 µs |
+| set | 30,131 | 44 µs | 72 µs | 245 µs | 439 µs |
+
+Zero failures, zero stale reads, zero lost writes; the final sweep
+checked all 100,000 keys. Throughput came out at 5,000.01 ops/s against
+a 5,000 target. Key counts were 29,887 / 37,244 / 32,869.
+
+These are a floor, not a result: everything is on one machine with no
+replication yet. Phase 14 measures properly.
+
+#### Phase 7 mutation checks
+
+1. Treating a miss as always fine failed
+   `TestChecker_Classification/a_miss_after_an_acknowledged_write_is_stale`.
+   A miss is sequence 0, which is below anything acknowledged, so it is
+   the same failure as any other backwards read.
+2. Making the final sweep stop reporting lost writes failed
+   `TestChecker_Final` and `TestDriver_DetectsLostWrites`.
+3. Removing the pruning of in-doubt writes below the acknowledged
+   sequence passed at first. The classification rule tests `got < acked`
+   before it consults the in-doubt set, so for classification the
+   pruning is redundant. It is not redundant for the final accounting:
+   without it, a write in doubt that a later acknowledged write
+   superseded is reported as having failed to land. Two cases were
+   added to `TestChecker_Final` to pin that, and the mutation now fails.
