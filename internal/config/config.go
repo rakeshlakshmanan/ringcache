@@ -33,6 +33,15 @@ type Config struct {
 	// Reflection registers the gRPC reflection service, so grpcurl can
 	// talk to the node without a copy of the protos.
 	Reflection bool
+	// StaticMembers is the fixed member list, as
+	// "node-1=host:7001,node-2=host:7002". It is used when no etcd
+	// endpoint is given. Empty means the node owns the whole keyspace
+	// on its own, which is what a single node without a cluster is.
+	//
+	// It is kept as the raw flag value: parsing it needs the ring
+	// package, and config sits below that. membership.ParseStatic reads
+	// it, and node.New reports what it says.
+	StaticMembers string
 }
 
 // Load parses args, which excludes the program name, into a Config. It
@@ -52,6 +61,8 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.MetricsListen, "metrics-listen", ":9100", "HTTP address serving /metrics and /healthz")
 	fs.StringVar(&logLevel, "log-level", "info", "minimum log level: debug, info, warn or error")
 	fs.BoolVar(&c.Reflection, "reflection", true, "register the gRPC reflection service")
+	fs.StringVar(&c.StaticMembers, "static-members", "",
+		"fixed member list as id=host:port,...; empty means this node owns the whole keyspace")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err

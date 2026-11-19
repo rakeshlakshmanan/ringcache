@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -19,22 +20,72 @@ import (
 // INVALID_ARGUMENT rather than an expiry that wrapped into the past.
 const maxTTL = uint64(math.MaxInt64 / int64(time.Millisecond))
 
+// epochRefreshTimeout bounds a background ring refresh. It is well
+// above a healthy fetch and well below the interval at which a node
+// would otherwise notice the change itself.
+const epochRefreshTimeout = 2 * time.Second
+
 // CacheServer serves the client-facing Cache API from one node's store.
 //
-// It holds no state of its own: identity, storage and ownership are all
-// injected, so later phases swap the Ownership without touching the
-// handlers.
+// It holds no state of its own beyond the stale-epoch guard: identity,
+// storage and ownership are all injected, so later phases swap the
+// Ownership without touching the handlers.
 type CacheServer struct {
 	ringcachev1.UnimplementedCacheServer
 
 	nodeID string
 	store  *store.Store
 	owner  Ownership
+
+	// refresh is called when a client reports an epoch newer than this
+	// node's. It runs in the background: the request it came with is
+	// answered from the ring the node has now, because blocking it
+	// would turn one node's slow refresh into every client's latency.
+	refresh func(context.Context) error
+	// refreshing stops a flood of clients at a newer epoch starting a
+	// refresh each. One is enough; the rest would fetch the same ring.
+	refreshing atomic.Bool
+}
+
+// CacheOption configures a CacheServer.
+type CacheOption func(*CacheServer)
+
+// WithEpochRefresher makes the server fetch a new ring in the
+// background when a client reports a newer epoch than its own. A node
+// behind the cluster's epoch is the one case where a client knows
+// something the node does not.
+func WithEpochRefresher(refresh func(context.Context) error) CacheOption {
+	return func(s *CacheServer) { s.refresh = refresh }
 }
 
 // NewCacheServer returns a CacheServer for the node with the given ID.
-func NewCacheServer(nodeID string, st *store.Store, owner Ownership) *CacheServer {
-	return &CacheServer{nodeID: nodeID, store: st, owner: owner}
+func NewCacheServer(nodeID string, st *store.Store, owner Ownership, opts ...CacheOption) *CacheServer {
+	s := &CacheServer{nodeID: nodeID, store: st, owner: owner}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// noteClientEpoch starts a background refresh when the client routed
+// with a ring newer than this node's.
+func (s *CacheServer) noteClientEpoch(clientEpoch uint64) {
+	if s.refresh == nil || clientEpoch <= s.epoch() {
+		return
+	}
+	if !s.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer s.refreshing.Store(false)
+
+		// The request's context is already finished by the time this
+		// matters, so the refresh gets its own deadline.
+		ctx, cancel := context.WithTimeout(context.Background(), epochRefreshTimeout)
+		defer cancel()
+		_ = s.refresh(ctx)
+	}()
 }
 
 // epoch reports the ring epoch this node is deciding from. Every
@@ -51,6 +102,8 @@ func (s *CacheServer) epoch() uint64 {
 // or expired reports found=false rather than an error, so a miss costs
 // the client no retry.
 func (s *CacheServer) Get(_ context.Context, req *ringcachev1.GetRequest) (*ringcachev1.GetResponse, error) {
+	s.noteClientEpoch(req.GetClientEpoch())
+
 	key, _, err := s.admitRead(req.GetKey())
 	if err != nil {
 		return nil, err
@@ -72,6 +125,8 @@ func (s *CacheServer) Get(_ context.Context, req *ringcachev1.GetRequest) (*ring
 // the key held. A ttl above zero becomes an absolute expiry here, so
 // every copy of the key expires at the same instant (FR-10).
 func (s *CacheServer) Set(_ context.Context, req *ringcachev1.SetRequest) (*ringcachev1.SetResponse, error) {
+	s.noteClientEpoch(req.GetClientEpoch())
+
 	if err := checkValue(req.GetValue()); err != nil {
 		return nil, err
 	}
@@ -96,6 +151,8 @@ func (s *CacheServer) Set(_ context.Context, req *ringcachev1.SetRequest) (*ring
 // version. Deleting an absent key is not an error: the tombstone still
 // has to exist, so a write already in flight cannot land behind it.
 func (s *CacheServer) Delete(_ context.Context, req *ringcachev1.DeleteRequest) (*ringcachev1.DeleteResponse, error) {
+	s.noteClientEpoch(req.GetClientEpoch())
+
 	key, _, err := s.admitWrite(req.GetKey())
 	if err != nil {
 		return nil, err
@@ -112,6 +169,8 @@ func (s *CacheServer) Delete(_ context.Context, req *ringcachev1.DeleteRequest) 
 // TTL reports the time left on a key. A key Get would miss reports
 // found=false; a key stored without an expiry reports has_ttl=false.
 func (s *CacheServer) TTL(_ context.Context, req *ringcachev1.TTLRequest) (*ringcachev1.TTLResponse, error) {
+	s.noteClientEpoch(req.GetClientEpoch())
+
 	key, _, err := s.admitRead(req.GetKey())
 	if err != nil {
 		return nil, err

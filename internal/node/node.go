@@ -23,6 +23,7 @@ import (
 	"github.com/rakeshlakshmanan/ringcache/internal/clock"
 	"github.com/rakeshlakshmanan/ringcache/internal/config"
 	"github.com/rakeshlakshmanan/ringcache/internal/hlc"
+	"github.com/rakeshlakshmanan/ringcache/internal/membership"
 	"github.com/rakeshlakshmanan/ringcache/internal/metrics"
 	"github.com/rakeshlakshmanan/ringcache/internal/server"
 	"github.com/rakeshlakshmanan/ringcache/internal/store"
@@ -53,8 +54,12 @@ type Options struct {
 	// listens on Config.Listen itself. The in-process test cluster
 	// passes a bufconn listener here.
 	Listener net.Listener
-	// Ownership decides which keys this node serves. Defaults to the
-	// single-node owner that accepts everything.
+	// Membership supplies the ring this node routes with. When it is
+	// nil the node builds a static source from Config.StaticMembers, or
+	// owns the whole keyspace alone when that is empty too.
+	Membership membership.Source
+	// Ownership decides which keys this node serves. It overrides
+	// Membership, and exists so a test can install a stub.
 	Ownership server.Ownership
 	// Gate rejects every request while it returns an error, whatever key
 	// the request names. Phase 10 passes the fencing gate.
@@ -68,9 +73,10 @@ type Node struct {
 	log *slog.Logger
 	c   clock.Clock
 
-	store   *store.Store
-	metrics *metrics.Metrics
-	gate    server.Gate
+	store      *store.Store
+	metrics    *metrics.Metrics
+	gate       server.Gate
+	membership membership.Source
 
 	grpc     *grpc.Server
 	listener net.Listener
@@ -110,9 +116,9 @@ func New(cfg config.Config, opts Options) (*Node, error) {
 	n.metrics = metrics.New(cfg.NodeID)
 	n.metrics.StoreSizes(cfg.NodeID, n.store.Len, n.store.Bytes)
 
-	owner := opts.Ownership
-	if owner == nil {
-		owner = server.AllOwner(cfg.NodeID, cfg.Advertise)
+	owner, cacheOpts, err := n.ownership(cfg, opts)
+	if err != nil {
+		return nil, err
 	}
 
 	in := server.NewInterceptors(n.metrics, n.log, n.c, n.gate)
@@ -128,7 +134,7 @@ func New(cfg config.Config, opts Options) (*Node, error) {
 		grpc.ChainUnaryInterceptor(in.Unary()),
 		grpc.ChainStreamInterceptor(in.Stream()),
 	)
-	ringcachev1.RegisterCacheServer(n.grpc, server.NewCacheServer(cfg.NodeID, n.store, owner))
+	ringcachev1.RegisterCacheServer(n.grpc, server.NewCacheServer(cfg.NodeID, n.store, owner, cacheOpts...))
 	if cfg.Reflection {
 		reflection.Register(n.grpc)
 	}
@@ -137,6 +143,43 @@ func New(cfg config.Config, opts Options) (*Node, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+// ownership picks what decides which keys this node serves, and the
+// cache server options that go with it.
+//
+// An explicit Ownership wins, so a test can install a stub. Otherwise a
+// membership source backs it: the one supplied, or a static one built
+// from the flag. With neither, the node owns the whole keyspace, which
+// is how a single node runs with no cluster around it.
+func (n *Node) ownership(cfg config.Config, opts Options) (server.Ownership, []server.CacheOption, error) {
+	if opts.Ownership != nil {
+		return opts.Ownership, nil, nil
+	}
+
+	src := opts.Membership
+	if src == nil {
+		if cfg.StaticMembers == "" {
+			return server.AllOwner(cfg.NodeID, cfg.Advertise), nil, nil
+		}
+		static, err := membership.NewStaticFromFlag(cfg.StaticMembers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("node: --static-members: %w", err)
+		}
+		src = static
+	}
+	n.membership = src
+
+	if r := src.Current(); r != nil && !r.Has(cfg.NodeID) {
+		// Catches the common mistake of starting a node with a member
+		// list that does not name it. It would otherwise start happily
+		// and answer every request with UNAVAILABLE.
+		return nil, nil, fmt.Errorf("node: %q is not in its own member list", cfg.NodeID)
+	}
+
+	return server.RingOwnership(cfg.NodeID, src),
+		[]server.CacheOption{server.WithEpochRefresher(src.Refresh)},
+		nil
 }
 
 // listen opens the gRPC and metrics listeners, closing whatever it

@@ -6,6 +6,8 @@ package server
 import (
 	ringcachev1 "github.com/rakeshlakshmanan/ringcache/gen/ringcachev1"
 	"github.com/rakeshlakshmanan/ringcache/internal/config"
+	"github.com/rakeshlakshmanan/ringcache/internal/membership"
+	"github.com/rakeshlakshmanan/ringcache/internal/ring"
 )
 
 // Ownership decides whether this node may serve a key, and publishes
@@ -57,3 +59,73 @@ func (*allOwner) CheckRead(uint64) error  { return nil }
 // never mutated after construction, so sharing it across concurrent
 // calls is safe.
 func (o *allOwner) RingView() *ringcachev1.RingView { return o.view }
+
+// ringOwnership answers from the ring the node currently holds. It is
+// what every node in a cluster runs: the source behind it is static in
+// phase 6 and etcd-backed from phase 9, and this code does not care
+// which.
+type ringOwnership struct {
+	nodeID string
+	src    membership.Source
+}
+
+// RingOwnership returns an Ownership deciding from src's current ring.
+func RingOwnership(nodeID string, src membership.Source) Ownership {
+	return &ringOwnership{nodeID: nodeID, src: src}
+}
+
+// CheckWrite allows the write only on the key's primary. One node per
+// key accepts writes within an epoch, which is what makes the version
+// stamped on a write beat everything it replaces.
+func (o *ringOwnership) CheckWrite(hash uint64) error {
+	r, err := o.serving()
+	if err != nil {
+		return err
+	}
+	if r.Lookup(hash).ID != o.nodeID {
+		return &WrongOwnerError{Epoch: r.Epoch()}
+	}
+	return nil
+}
+
+// CheckRead allows the read anywhere on the key's preference list,
+// since every node in it holds a copy.
+func (o *ringOwnership) CheckRead(hash uint64) error {
+	r, err := o.serving()
+	if err != nil {
+		return err
+	}
+	for _, m := range r.PreferenceList(hash) {
+		if m.ID == o.nodeID {
+			return nil
+		}
+	}
+	return &WrongOwnerError{Epoch: r.Epoch()}
+}
+
+// serving returns the ring to decide from, or the reason this node
+// cannot decide at all.
+func (o *ringOwnership) serving() (*ring.Ring, error) {
+	r := o.src.Current()
+	if r == nil {
+		return nil, ErrNoRing
+	}
+	// A node missing from its own ring owns nothing and holds nothing
+	// anyone should read: its keys have been handed to others. Answering
+	// WRONG_OWNER would send the client back here after a refresh, so it
+	// reports UNAVAILABLE and the client tries elsewhere.
+	if !r.Has(o.nodeID) {
+		return nil, ErrNotMember
+	}
+	return r, nil
+}
+
+// RingView returns the view the node is deciding from, or nil when it
+// has no ring. GetRing turns nil into UNAVAILABLE.
+func (o *ringOwnership) RingView() *ringcachev1.RingView {
+	r := o.src.Current()
+	if r == nil {
+		return nil
+	}
+	return r.View().ToProto()
+}

@@ -381,3 +381,110 @@ the third exposed a real gap that has since been closed.
    merging across a gap would claim a stretch whose ownership did not
    change — and `TestMergeAdjacent` now covers it directly, which makes
    the mutation fail.
+
+### Phase 6
+
+- Dependency added: `golang.org/x/sync` (already present from phase 4's
+  errgroup; phase 6 uses its `singleflight` as well), named by the plan.
+- `--static-members` is kept in `Config` as the raw flag string.
+  Parsing it needs `ring`, and `config` sits below that: making the
+  lowest package depend on the ring would invert the layering for one
+  field. `membership.ParseStatic` reads it and `node.New` reports what
+  it says, so a bad list still fails before the node serves.
+- An empty `--static-members` keeps phase 4's behaviour: the node owns
+  the whole keyspace through `AllOwner`. That is what a single node
+  with no cluster around it is, and it keeps the phase 4 manual
+  commands working unchanged.
+- `node.New` fails when the node's own ID is missing from its member
+  list. It would otherwise start happily and answer every request with
+  UNAVAILABLE, which is a confusing way to learn of a typo.
+- A node missing from its current ring reports `ErrNotMember`, which
+  maps to UNAVAILABLE, not a wrong-owner error. A wrong-owner error
+  tells the client to refresh and route again, and the refreshed ring
+  would send it straight back to the same node.
+- `Source.Subscribe` hands a new watcher the current ring at once
+  rather than only future ones, so a component that subscribes after
+  the first ring was published does not wait for a change to learn
+  there is one. The channel holds a single value, newest wins: only the
+  newest ring decides anything.
+- The client's ring lives in an `atomic.Pointer`, so routing takes no
+  lock, and `install` uses `CompareAndSwap` and ignores an epoch at or
+  below the current one. Two refreshes can land out of order, and the
+  slower one must not undo the newer.
+- Ring refreshes are deduplicated with `singleflight`. A hundred
+  requests meeting a stale ring at once need one `GetRing` between
+  them, not a hundred.
+- A refresh triggered by a response's epoch runs in the background. The
+  call that noticed already has its answer; making it wait would turn
+  one node's slow refresh into every client's latency. The same holds
+  on the node side, where `WithEpochRefresher` guards with an atomic so
+  a flood of clients at a newer epoch starts one refresh, not thousands.
+- The retry policy distinguishes reads from writes. A read that meets
+  UNAVAILABLE or a timeout goes to the next member of the preference
+  list, which holds a copy. A write has nowhere else to go, because
+  only the primary may accept it; phase 10 adds the wait for the epoch
+  that names a new one. A wrong-owner error is only worth retrying when
+  the node's epoch is actually newer than the client's, or the client
+  would refresh to the same ring and route to the same node.
+- After a refresh the list of already-tried nodes is cleared. The
+  refreshed ring may route back to a node that objected, and that is
+  correct: it objected because the client was routing with an old ring.
+- Connections are keyed by member ID and kept for 10 s after a member
+  leaves the ring, since a ring is republished for reasons that have
+  nothing to do with that member and reopening costs a handshake. A
+  member whose address changed is a restarted node, so its old
+  connection is closed at once rather than lingering.
+- `withInitialRing` is unexported and reached through `export_test.go`.
+  Only a test wants to start a client with a deliberately stale ring,
+  so the option stays out of the public API.
+- `CallInfo` records attempts, the member that answered, the final code
+  and whether the ring was refreshed. A cache client hides routing and
+  retries, and phase 7's checker has to attribute what it measures.
+- The test cluster opens every listener before building the member
+  list, because the list has to name the addresses the nodes will serve
+  on and only the kernel knows which ports those are. `Stop` drains as
+  SIGTERM does; `Kill` closes the server outright, which is what a
+  crash looks like to everyone else.
+- `TestStatic_FiveNodesReadBack` drives its 100,000 keys through 32
+  goroutines sharing one client. Sequentially the 200,000 round trips
+  took 16.2 s, close to the plan's 20 s ceiling and worse under
+  `-race`; concurrently it takes 2.7 s, and sharing one client is how a
+  program should use it anyway.
+
+#### Phase 6 measurements
+
+100,000 keys written through the client across five nodes, each key
+checked in every node's store:
+
+| Node | Keys held |
+|---|---|
+| node-1 | 18,969 |
+| node-2 | 19,994 |
+| node-3 | 19,755 |
+| node-4 | 20,270 |
+| node-5 | 21,012 |
+
+Every key was held by its primary and by no one else, which is what
+FR-01 asks for before replication exists.
+
+#### Phase 6 manual verification
+
+Three nodes were started with one `--static-members` list and driven
+with `ringctl`. `ringctl ring` reported epoch 1 with three members.
+Five keys were written through one node's address and read back through
+a different one; each was served by its own primary in one attempt, and
+the per-node `ringcache_store_keys` gauges showed 3, 2 and 0, so the
+client routed rather than any node forwarding. A missing key reported
+`(not found)` rather than an error.
+
+#### Phase 6 mutation checks
+
+All three were caught.
+
+1. Letting `CheckWrite` accept any member of the preference list, not
+   only the primary, failed `TestOwnership_Table/replica` and
+   `TestOwnership_EveryKeyHasOneWriter`.
+2. Letting a write retry elsewhere when the primary is down failed
+   `TestClient_WriteDoesNotRetryElsewhere`.
+3. Dropping the refresh-and-retry on a wrong-owner error failed
+   `TestClient_StaleRingRefresh`.

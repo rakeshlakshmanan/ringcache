@@ -20,6 +20,12 @@ var ErrNoRing = errors.New("server: no ring yet")
 // sets it; it maps to UNAVAILABLE for the same reason as ErrNoRing.
 var ErrFenced = errors.New("server: node is fenced")
 
+// ErrNotMember is returned by a node missing from its own current ring.
+// It owns nothing and holds nothing anyone should read, and a refresh
+// would not change that, so it maps to UNAVAILABLE rather than to a
+// wrong-owner error that would send the client straight back.
+var ErrNotMember = errors.New("server: node is not in its own ring")
+
 // WrongOwnerError says this node does not own the key. Epoch is the
 // ring epoch the node decided from, so a client can tell whether its
 // own ring is behind.
@@ -57,7 +63,7 @@ func toStatus(err error) error {
 	if errors.As(err, &wrong) {
 		return wrongOwner(wrong.Epoch)
 	}
-	if errors.Is(err, ErrNoRing) || errors.Is(err, ErrFenced) {
+	if errors.Is(err, ErrNoRing) || errors.Is(err, ErrFenced) || errors.Is(err, ErrNotMember) {
 		return status.Error(codes.Unavailable, err.Error())
 	}
 	if _, ok := status.FromError(err); ok {
