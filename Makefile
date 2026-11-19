@@ -6,9 +6,10 @@ GO ?= go
 build:
 	@if [ -d cmd ]; then $(GO) build -o bin/ ./cmd/...; else echo "build: no binaries under cmd/ yet (first binary arrives in phase 4)"; fi
 
-## proto: regenerate gen/ from proto/ with buf (real from phase 3)
+## proto: lint proto/ and regenerate gen/ from it with buf
 proto:
-	@if [ -d proto ]; then $(GO) tool buf generate proto; else echo "proto: not implemented yet (phase 3)"; fi
+	$(GO) tool buf lint proto
+	$(GO) tool buf generate --template proto/buf.gen.yaml proto
 
 ## lint: go vet and staticcheck (shellcheck joins in phase 13)
 lint:

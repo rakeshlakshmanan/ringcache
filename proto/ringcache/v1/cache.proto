@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package ringcache.v1;
+
+import "ringcache/v1/types.proto";
+
+option go_package = "github.com/rakeshlakshmanan/ringcache/gen/ringcachev1;ringcachev1";
+
+// Cache is the API clients use. Clients route by key from a cached
+// ring and talk to nodes directly; nothing sits in between.
+//
+// Errors use gRPC status codes:
+//
+//   - WRONG_OWNER is FAILED_PRECONDITION with a WrongOwner detail
+//     carrying the node's epoch. A node returns it when it is not the
+//     key's primary for a write, or not on the key's preference list
+//     for a read. The client refreshes its ring and retries once.
+//   - UNAVAILABLE comes from a node that is fenced, because it could
+//     not renew its etcd lease, or that has no ring yet. The client
+//     retries on another node.
+//   - INVALID_ARGUMENT means the key is empty or over MaxKeyBytes, or
+//     the value is over MaxValueBytes. Retrying will not help.
+//
+// Every response carries the serving node's epoch, so a client learns
+// its ring is stale even from a request that succeeded.
+service Cache {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc TTL(TTLRequest) returns (TTLResponse);
+  // GetRing returns the node's current ring. Clients call it to
+  // bootstrap, to refresh after a WRONG_OWNER, and while waiting for a
+  // new epoch during a failover.
+  rpc GetRing(GetRingRequest) returns (RingView);
+}
+
+message GetRequest {
+  bytes key = 1;
+  // The epoch of the ring the client routed with. A node whose epoch is
+  // lower refreshes its own ring in the background.
+  uint64 client_epoch = 2;
+}
+
+message GetResponse {
+  // False for a key that is absent, deleted or expired. A miss is not
+  // an error.
+  bool found = 1;
+  bytes value = 2;
+  Version version = 3;
+  uint64 node_epoch = 4;
+  // The node that served this read. In async mode a replica can answer
+  // with a value a few writes behind, and the checker uses this to
+  // attribute stale reads.
+  string served_by = 5;
+}
+
+message SetRequest {
+  bytes key = 1;
+  bytes value = 2;
+  // Time to live in milliseconds, 0 for no expiry. The primary turns it
+  // into an absolute expiry immediately.
+  uint64 ttl_ms = 3;
+  uint64 client_epoch = 4;
+}
+
+message SetResponse {
+  Version version = 1;
+  uint64 node_epoch = 2;
+  string served_by = 3;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  uint64 client_epoch = 2;
+}
+
+message DeleteResponse {
+  // The tombstone's version.
+  Version version = 1;
+  uint64 node_epoch = 2;
+  string served_by = 3;
+}
+
+message TTLRequest {
+  bytes key = 1;
+  uint64 client_epoch = 2;
+}
+
+message TTLResponse {
+  // False when Get would miss the key.
+  bool found = 1;
+  // False when the key is stored without an expiry.
+  bool has_ttl = 2;
+  int64 remaining_ms = 3;
+  uint64 node_epoch = 4;
+}
+
+message GetRingRequest {}

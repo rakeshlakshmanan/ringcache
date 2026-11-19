@@ -155,3 +155,42 @@ wall-clock versions of the preloaded entries, so every apply was
 rejected as stale and the benchmark timed the reject path at 30 ns while
 appearing to succeed. The metric now reads 99.96%, the remainder being
 genuine races where a higher sequence reached the same key first.
+
+### Phase 3
+
+- Three buf STANDARD lint rules are excepted in `proto/buf.yaml`, with
+  the reason recorded there. The specification fixes these names in
+  section 12 and later phases refer to them, so the wire contract wins
+  over buf's naming conventions:
+  - `SERVICE_SUFFIX`: the spec declares `service Cache` and
+    `service Peer`, not `CacheService` and `PeerService`.
+  - `RPC_RESPONSE_STANDARD_NAME`: `GetRing` returns the shared
+    `RingView` rather than a `GetRingResponse` wrapper; `Replicate`
+    returns `ReplicateAck` and `StreamRange` returns `EntryBatch`, each
+    named for what it carries.
+  - `RPC_REQUEST_STANDARD_NAME`: `StreamRange` takes `RangeRequest`.
+
+  Every other STANDARD rule applies, including the enum prefix and
+  zero-value rules that `AckStatus` already satisfies.
+- The protos live at `proto/ringcache/v1/`, which buf's
+  `PACKAGE_DIRECTORY_MATCH` requires for package `ringcache.v1`, but the
+  plan puts the generated Go in `gen/ringcachev1/`. Passing
+  `module=github.com/rakeshlakshmanan/ringcache/gen` to both plugins
+  strips that prefix from each file's `go_package`, so generation lands
+  in `gen/ringcachev1/` instead of a tree mirroring the import path.
+  `paths=source_relative` would have produced `gen/ringcache/v1/`.
+- `buf.gen.yaml` sits in `proto/` as the plan says, so `make proto`
+  passes it explicitly with `--template`; buf otherwise looks for it in
+  the working directory. Both plugins are invoked as
+  `["go", "tool", "protoc-gen-go"]`, so the versions pinned in `go.mod`
+  are the ones that run and nothing has to be installed separately.
+- `make proto` lints before it generates, so a malformed proto fails
+  before it can produce Go.
+- Dependencies promoted to direct requirements by `go mod tidy`:
+  `google.golang.org/grpc` and `google.golang.org/protobuf`, both
+  already present as tool dependencies.
+- The CI job now regenerates and runs `git diff --exit-code`. The check
+  was verified by appending a message to `types.proto` without
+  regenerating: the diff reported both the proto and the stale
+  `types.pb.go`, so drift fails the build rather than passing quietly.
+  Regeneration is byte-identical, which that check depends on.
