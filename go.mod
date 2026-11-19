@@ -9,6 +9,8 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
+require github.com/cespare/xxhash/v2 v2.3.0
+
 require (
 	buf.build/gen/go/bufbuild/bufplugin/protocolbuffers/go v1.36.12-20261002170247-538130002972.2 // indirect
 	buf.build/gen/go/bufbuild/protodescriptor/protocolbuffers/go v1.36.12-20261012172039-ff528c23443f.2 // indirect
@@ -34,7 +36,6 @@ require (
 	github.com/bufbuild/buf v1.74.0 // indirect
 	github.com/bufbuild/protocompile v0.14.2-0.20261013160345-b79bfe2f85df // indirect
 	github.com/bufbuild/protoplugin v0.0.0-20260414125817-25d1d281b46b // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cli/browser v1.3.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
