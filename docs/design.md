@@ -291,3 +291,93 @@ miss, an empty key gave INVALID_ARGUMENT, and `/metrics` carried the
 The image was built and run: the container reached `healthy` through the
 `--healthcheck` probe, served RPCs on its published ports, ran as
 `nonroot`, and exited 0 on `docker stop`.
+
+### Phase 5
+
+- No dependencies added. The package is pure: no I/O, no clock, no
+  goroutines, so a node, a client and the coordinator all reach the
+  same conclusions from the same `View`.
+- A `Ring` is immutable once built. Publishing a new ring means building
+  another and swapping the pointer, so readers need no lock.
+- `New` rejects a member without an address. A member that cannot be
+  dialled is useless in a preference list, and every real source of
+  members — etcd registrations in phase 9 — has one. `RF` above the
+  member count is allowed: a shorter preference list is the normal state
+  of a cluster that has just lost a node.
+- `New` drops a token whose position equals the previous one's. A 64-bit
+  collision is vanishingly unlikely, but the second token's arc would be
+  `(p, p]`, which the half-open rule reads as the whole ring, so the
+  ring's invariants should not rest on it not happening.
+- `PreferenceIDs` sits beside `PreferenceList` because the arcs and
+  `Diff` compare lists far more often than they read addresses, and
+  `prefIndexes` takes a reusable buffer so neither allocates per key.
+- `Arcs` and `Diff` merge through one generic helper, `mergeAdjacent`,
+  which also closes a run across the top of the ring.
+- `Diff` accepts a nil old ring, which is the first published ring's
+  case in phase 9: the whole ring is then new.
+- `Diff` compares preference lists, not members, so a new epoch with the
+  same members produces no changes. The ring is who holds what, not the
+  number it was published under.
+
+#### Phase 5 measurements
+
+All with node-1 to node-5, 256 tokens each, RF 2, keys named `key-<i>`,
+as the plan fixes them.
+
+| Measurement | Result | Target |
+|---|---|---|
+| Balance, largest share of 1,000,000 keys | 1.0533x the mean (node-5) | at most 1.15x (NFR-08) |
+| Keys changing primary, 4 nodes to 5 | 21.07% | 17% to 23% (FR-02) |
+| Modulo baseline, 4 nodes to 5 | 80.00% | 79% to 81% |
+| Removing node-3 from 5 | all 39,477 affected keys promoted to their replica | every one (phase 10 failover) |
+
+`go run ./cmd/ringctl sim-move` prints:
+
+```
+1000000 keys, 4 nodes -> 5 nodes, 256 tokens per node
+
+  consistent hashing    21.07%  (210656 keys change primary)
+  modulo hashing        80.00%  (800022 keys change primary)
+
+  consistent hashing moves 3.8x less data
+```
+
+Benchmarks (Apple M4, 10 cores, darwin/arm64, `-benchtime 2s`):
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `BenchmarkRing_Lookup` | 21.91 | 0 | 0 |
+| `BenchmarkRing_PreferenceList` | 64.13 | 88 | 3 |
+| `BenchmarkDiff` (4 to 5 nodes) | 138,491 | 223,281 | 2,567 |
+
+A lookup costs about the same as a store read, so routing adds nothing
+measurable to a request. `Diff` runs once per published ring, not per
+request, so its 0.14 ms is irrelevant to the latency targets.
+
+#### Phase 5 mutation checks
+
+Three mutations were run against the tests; the first two were caught,
+the third exposed a real gap that has since been closed.
+
+1. Making `Lookup` land on the token after an exact hit, rather than on
+   it, failed `TestRing_LookupWrap`,
+   `TestRing_ArcsMatchPreferenceLists` and
+   `TestDiff_MatchesPreferenceLists`.
+2. Removing the merge across the top of the ring passed everything at
+   first. The production shape never reaches that branch: it fires only
+   when the lowest and highest tokens belong to one member, which five
+   members with 256 tokens do not do. A sweep found inputs that do —
+   two members with 23 tokens each puts node-2 at both ends — and
+   `TestRing_ArcsMergeAcrossTopOfRing` now pins that case.
+   `TestMergeAdjacent` covers the helper directly as well. With both,
+   the mutation fails.
+3. Removing the touching check from the merge also passed at first.
+   `Arcs` hands in a slice that tiles the ring, so the check is always
+   true there; `Diff` hands in only the stretches that differ, where two
+   neighbours can have a gap. A sweep over member counts 2 to 6 and
+   token counts 1 to 128, plus the production shapes, found no ring pair
+   where two *neighbouring* changes share a payload across a gap, so the
+   check is defensive rather than reachable from a ring. It is kept —
+   merging across a gap would claim a stretch whose ownership did not
+   change — and `TestMergeAdjacent` now covers it directly, which makes
+   the mutation fail.
