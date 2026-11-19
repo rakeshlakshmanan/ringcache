@@ -84,3 +84,74 @@ owners first and switches the ring when every copy is done.
   attribute, because the plan fixes `New(nodeID string, c clock.Clock)`
   and takes no logger. Its once-a-minute rate limit reads the injected
   `clock.Clock`, so a fake clock makes the suppression deterministic.
+
+### Phase 2
+
+- `Entry.Size` takes the key, as `Size(key string) int64`, because an
+  `Entry` doesn't hold its key and the plan's figure is key plus value
+  plus 64. `KeyedEntry.Size()` is the no-argument form.
+- `Apply` computes `Hash` itself rather than trusting the sender. The
+  proto `Entry` carries no hash field, so `Hash` is local bookkeeping;
+  recomputing it also means a sender can't steer an entry into the wrong
+  shard. `Apply` clones the value for the same reason `SetLocal` does:
+  entries arrive in gRPC buffers that may be reused.
+- `Apply` calls `hlc.Update` while holding the shard write lock, so the
+  lock order is shard then HLC. `writeLocal` takes them in the same
+  order through `NowAfter`, so the two paths can't deadlock.
+- An entry exactly at its `ExpiresAt` counts as expired, matching the
+  plan's "at or before now" for reads. `Entry.Expired(nowMs)` is the one
+  place that rule lives, shared by `Get`, `Apply`, the sweep and scans.
+- `Wipe` subtracts what each shard actually held instead of zeroing the
+  totals, so a write landing in an already-wiped shard can't leave the
+  counters wrong. `SweepOnce` returns how many entries it removed, which
+  the plan leaves unspecified; tests and the later metrics both want it.
+- `Scan` batches per shard and never spans two shards, since it lists
+  one shard's keys and drains them before moving on. With 256 shards and
+  a 100-entry cap, 5,001 matching keys came back as 256 batches of about
+  20 rather than 51 full ones. Batches are therefore smaller than the
+  cap at small data sizes, which costs a few extra RPCs during migration
+  and keeps each lock hold short.
+- Unexpired tombstones travel with a scan; expired entries, tombstones
+  included, are skipped. Sending the tombstone is what stops a delete
+  being undone by the snapshot it raced.
+- `Entry` is immutable once stored, so `Get` and `Scan` hand back copies
+  of the struct that share `Value` with the store without a copy. A
+  write replaces the whole entry rather than editing it, so a shared
+  slice stays valid after the key is overwritten. Callers must not
+  modify `Value`.
+- Test additions beyond the plan's table: `assertConsistent` walks every
+  shard and checks the atomic totals, each shard's byte count and the
+  expiry index against the actual contents. A mutation that dropped the
+  `delta -= old.Size(key)` subtraction on overwrite was caught by four
+  tests, so the accounting is genuinely covered. Also added: value-copy
+  on write, oversize scan entries, tombstone and expiry handling in
+  scans, `Scan` error and cancellation propagation, `DeleteMatching`,
+  and distinct versions under concurrent writes to one key.
+
+#### Phase 2 benchmarks
+
+Apple M4, 10 cores, darwin/arm64, Go 1.27.4, `-benchtime 3s`:
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `BenchmarkStore_GetParallel` | 18.94 | 0 | 0 |
+| `BenchmarkStore_SetParallel` | 195.9 | 112 | 1 |
+| `BenchmarkStore_ApplyParallel` | 166.7 | 112 | 1 |
+
+No thresholds attach to these; they are recorded as the plan asks.
+
+Reads allocate nothing and cost about 19 ns. Both write paths cost about
+170 to 200 ns and allocate once, for the value copy. The gap is the HLC:
+it is one mutex for the whole node, so writes serialise through it
+however many shards they land in. That caps a node at roughly 5 million
+writes per second, about three orders of magnitude above the 4,000
+writes per second the 20,000 ops/s target implies at a 20% write share,
+so it is recorded as a known ceiling rather than a problem to fix.
+
+`BenchmarkStore_ApplyParallel` reports a `%stored` metric, which earned
+its place immediately: the first version of the benchmark built
+synthetic versions from a fixed `1 << 40` wall value, below the real
+wall-clock versions of the preloaded entries, so every apply was
+rejected as stale and the benchmark timed the reject path at 30 ns while
+appearing to succeed. The metric now reads 99.96%, the remainder being
+genuine races where a higher sequence reached the same key first.
